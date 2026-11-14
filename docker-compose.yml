@@ -76,6 +76,38 @@ services:
       timeout: 5s
       retries: 10
 
+  airflow:
+    image: apache/airflow:3.0.1
+    container_name: streamvec-airflow
+    ports:
+      - "8080:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project/airflow/dags
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-streamvec}
+      POSTGRES_USER: ${POSTGRES_USER:-streamvec}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-streamvec_pass}
+      STREAMVEC_API_URL: http://host.docker.internal:8000
+      PYTHONPATH: /opt/airflow/project
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/opt/airflow/project
+    command: >
+      bash -c "pip install --no-cache-dir psycopg[binary]==3.2.3 pgvector==0.3.6 pyarrow==18.1.0 httpx==0.28.1 python-dotenv==1.0.1 &&
+               airflow standalone"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - streamvec-net
+
 volumes:
   kafka_data:
   pg_data:

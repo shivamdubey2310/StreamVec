@@ -5,12 +5,13 @@ import os
 import random
 import time
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Any, Iterator
 
 import httpx
 from confluent_kafka import Producer
 from dotenv import load_dotenv
 
+from producer.dlq import DLQRouter
 from producer.schemas import DocumentEvent
 from producer.topics import ensure_topics_exist
 
@@ -27,46 +28,52 @@ SAMPLE_TOPICS = [
 ]
 
 
-def generate_synthetic_events(count: int, duplicate_ratio: float = 0.2, update_ratio: float = 0.15) -> Iterator[DocumentEvent]:
-    seen_docs: list[DocumentEvent] = []
+def generate_synthetic_raw_records(
+    count: int,
+    duplicate_ratio: float = 0.2,
+    update_ratio: float = 0.15,
+    poison_pills: int = 0,
+) -> Iterator[dict[str, Any] | str]:
+    seen_docs: list[dict[str, Any]] = []
     for i in range(count):
         roll = random.random()
         if seen_docs and roll < duplicate_ratio:
-            # Exact duplicate event (refreshed timestamp, identical title + body)
             orig = random.choice(seen_docs)
-            yield DocumentEvent(
-                doc_id=orig.doc_id,
-                source=orig.source,
-                title=orig.title,
-                body=orig.body,
-                published_at=datetime.now(timezone.utc),
-            )
+            yield {**orig, "published_at": datetime.now(timezone.utc).isoformat()}
         elif seen_docs and roll < (duplicate_ratio + update_ratio):
-            # Revised document body (triggers ACID chunk replacement downstream)
             orig = random.choice(seen_docs)
-            updated = DocumentEvent(
-                doc_id=orig.doc_id,
-                source=orig.source,
-                title=orig.title,
-                body=f"{orig.body} Revision {i}: updated benchmark telemetry confirms sub-20ms p95 query latency under concurrent load.",
-                published_at=datetime.now(timezone.utc),
-            )
+            updated = {
+                **orig,
+                "body": f"{orig['body']} Revision {i}: updated benchmark telemetry confirms sub-20ms p95 query latency under concurrent load.",
+                "published_at": datetime.now(timezone.utc).isoformat(),
+            }
             seen_docs.append(updated)
             yield updated
         else:
             title_base, body_base = random.choice(SAMPLE_TOPICS)
-            doc = DocumentEvent(
-                doc_id=f"arxiv-2026.{10000 + i}",
-                source="arxiv",
-                title=f"{title_base} — Study #{i}",
-                body=f"{body_base} Document identifier arxiv-2026.{10000 + i} evaluates throughput, recall@5, and memory bounds on CPU hardware.",
-                published_at=datetime.now(timezone.utc),
-            )
+            doc = {
+                "doc_id": f"arxiv-2026.{10000 + i}",
+                "source": "arxiv",
+                "title": f"{title_base} — Study #{i}",
+                "body": f"{body_base} Document identifier arxiv-2026.{10000 + i} evaluates throughput, recall@5, and memory bounds on CPU hardware.",
+                "published_at": datetime.now(timezone.utc).isoformat(),
+                "is_deleted": False,
+            }
             seen_docs.append(doc)
             yield doc
 
+    # Inject malformed records to verify DLQ isolation
+    bad_templates: list[dict[str, Any] | str] = [
+        '{"doc_id": "corrupt-json", "body": truncated...',
+        {"doc_id": "", "source": "arxiv", "title": "Missing ID", "body": "Valid body length above twenty chars."},
+        {"doc_id": "bad-empty-body", "source": "arxiv", "title": "Empty Body", "body": "   ", "is_deleted": False},
+        {"doc_id": "bad-short-body", "source": "arxiv", "title": "Too Short", "body": "tiny", "is_deleted": False},
+    ]
+    for idx in range(poison_pills):
+        yield bad_templates[idx % len(bad_templates)]
 
-def stream_wikimedia_events(limit: int) -> Iterator[DocumentEvent]:
+
+def stream_wikimedia_raw_records(limit: int) -> Iterator[dict[str, Any]]:
     url = "https://stream.wikimedia.org/v2/stream/recentchange"
     headers = {"User-Agent": "StreamVec-DataEngineering-Pipeline/1.0"}
     emitted = 0
@@ -82,22 +89,20 @@ def stream_wikimedia_events(limit: int) -> Iterator[DocumentEvent]:
             comment = payload.get("comment") or ""
             title = payload.get("title") or "Untitled"
             body = f"Wikipedia revision on {title} by {payload.get('user', 'unknown')}. Edit summary: {comment}. Server: {payload.get('server_name', 'en.wikipedia.org')}."
-            if not is_deleted and len(body.strip()) < 20:
-                continue
-            yield DocumentEvent(
-                doc_id=f"wiki-{payload.get('page_id', payload.get('id'))}",
-                source="wikimedia",
-                title=title,
-                body="" if is_deleted else body,
-                published_at=datetime.now(timezone.utc),
-                is_deleted=is_deleted,
-            )
+            yield {
+                "doc_id": f"wiki-{payload.get('page_id', payload.get('id'))}",
+                "source": "wikimedia",
+                "title": title,
+                "body": "" if is_deleted else body,
+                "published_at": datetime.now(timezone.utc).isoformat(),
+                "is_deleted": is_deleted,
+            }
             emitted += 1
             if emitted >= limit:
                 break
 
 
-def run_producer(mode: str, count: int) -> None:
+def run_producer(mode: str, count: int, poison_pills: int = 0) -> None:
     bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     raw_topic = os.getenv("KAFKA_RAW_TOPIC", "raw_documents")
     dlq_topic = os.getenv("KAFKA_DLQ_TOPIC", "documents_dlq")
@@ -110,8 +115,13 @@ def run_producer(mode: str, count: int) -> None:
         "linger.ms": 10,
         "compression.type": "lz4",
     })
+    dlq = DLQRouter(producer=producer, dlq_topic=dlq_topic)
 
-    events = generate_synthetic_events(count) if mode == "synthetic" else stream_wikimedia_events(count)
+    records = (
+        generate_synthetic_raw_records(count, poison_pills=poison_pills)
+        if mode == "synthetic"
+        else stream_wikimedia_raw_records(count)
+    )
     delivered = 0
 
     def on_delivery(err, msg):
@@ -122,7 +132,10 @@ def run_producer(mode: str, count: int) -> None:
             delivered += 1
 
     start = time.perf_counter()
-    for event in events:
+    for raw_record in records:
+        event, is_valid = dlq.validate_or_quarantine(raw_record, source_stage="producer_validation")
+        if not is_valid or event is None:
+            continue
         producer.produce(
             topic=raw_topic,
             key=event.doc_id.encode("utf-8"),
@@ -133,12 +146,18 @@ def run_producer(mode: str, count: int) -> None:
 
     producer.flush(timeout=15)
     elapsed = time.perf_counter() - start
-    logger.info("Produced %d events to '%s' in %.2fs (%.1f events/s)", delivered, raw_topic, elapsed, delivered / max(elapsed, 1e-6))
+    logger.info(
+        "Completed run | valid_delivered=%d | dlq_quarantined=%d | elapsed=%.2fs",
+        delivered,
+        dlq.quarantined_count,
+        elapsed,
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="StreamVec Kafka Event Producer")
     parser.add_argument("--mode", choices=["synthetic", "wikimedia"], default="synthetic")
     parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--poison-pills", type=int, default=0, help="Number of malformed payloads to inject")
     args = parser.parse_args()
-    run_producer(mode=args.mode, count=args.count)
+    run_producer(mode=args.mode, count=args.count, poison_pills=args.poison_pills)

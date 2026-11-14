@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# Environment & Secrets
+.env
+
+# Local Data & Cold Storage Archives
+archive/*
+!archive/.gitkeep
+data/
+*.parquet
+
+# Airflow local runtime artifacts
+airflow/logs/
+airflow/*.db
+airflow/*.pid
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# My Guide files
+StreamVec_metrics.md
+StreamVec.md
+StreamVec_plan.md

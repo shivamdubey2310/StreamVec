@@ -6,34 +6,7 @@
 
 ## Architecture
 
-```text
-┌──────────────────┐  events  ┌──────────────────────────────────────────┐
-│ 1 Live Producer  │─────────▶│ 2 Apache Kafka 3.8 (KRaft)               │
-│  arXiv / SSE     │          │  ├── topic: raw_documents (3 partitions) │
-└──────────────────┘          │  └── topic: documents_dlq (headers)      │
-                              └────────────────────┬─────────────────────┘
-                                                   │ consume micro-batch (32)
-                              ┌────────────────────▼─────────────────────┐
-                              │ 3 Stream Processor (Python + FastEmbed)  │
-                              │  ├── Redis MGET SHA-256 Dedup Cache      │
-                              │  ├── Sentence-Aware Overlapping Chunker  │
-                              │  └── bge-small-en-v1.5 (384d ONNX CPU)   │
-                              └────────────────────┬─────────────────────┘
-                                                   │ ACID transaction
-                              ┌────────────────────▼─────────────────────┐
-                              │ 4 PostgreSQL 16 + pgvector               │
-                              │  ├── HNSW Index (vector_cosine_ops)      │
-                              │  └── GIN Index (generated tsvector)      │
-                              └────────────────────┬─────────────────────┘
-                                                   │
-                 ┌─────────────────────────────────┼─────────────────────────────────┐
-                 ▼                                 ▼                                 ▼
-┌─────────────────────────────────┐ ┌──────────────────────────────┐ ┌──────────────────────────────┐
-│ 5 FastAPI Serving Layer         │ │ 6 Apache Airflow 3 DAG       │ │ 7 Cold Storage Tier          │
-│  POST /search (Single-CTE RRF)  │ │  Daily MRR & Hit@5 Gate      │ │  Hive-Partitioned Parquet    │
-└─────────────────────────────────┘ └──────────────────────────────┘ └──────────────────────────────┘
-
-```
+![Architecture_diagram](Architecture.png)
 
 ---
 
